@@ -26,8 +26,9 @@ pip install torch numpy transformers sympy
 from typing import List
 from dataclasses import dataclass, field
 import math
+import time
 
-## third-class
+## third-party
 from sympy import isprime
 import numpy as np
 import torch
@@ -35,8 +36,32 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex 
 
+def human_format(num):
+    magnitude = 0
+    while abs(num) >= 1000:
+        magnitude += 1
+        num /= 1000.0
+    return "{}{}".format('{:f}'.format(num).rstrip('0').rstrip('.'), ['', 'K', 'M', 'B', 'T'][magnitude])
+
+# @dataclass
+# class EngramConfig:
+#     # 100B级别配置
+#     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
+#     engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
+
+#     max_ngram_size: int = 3 
+#     n_embed_per_ngram: int = 512
+#     n_head_per_ngram: int = 8
+
+
+#     layer_ids: List[int] = field(default_factory=lambda: [1])  # 先只放 1 层，避免变成 200B
+#     pad_id: int = 2
+#     seed: int = 0
+#     kernel_size: int = 4
+
 @dataclass
 class EngramConfig:
+    # 0.67B级别配置
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     max_ngram_size: int = 3
@@ -324,7 +349,7 @@ class MultiHeadEmbedding(nn.Module):
         return output
     
 class Engram(nn.Module):
-    def __init__(self,layer_id):
+    def __init__(self, layer_id):
         super().__init__()
         self.layer_id = layer_id
         self.hash_mapping = NgramHashMapping(
@@ -354,14 +379,26 @@ class Engram(nn.Module):
         )
         self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
         self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+
+        list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y]
+        total_N = sum(list_of_N)
+        D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram
+        print(f"[Engram]: tables={len(list_of_N)} total_N={human_format(total_N)} D={D} params={human_format(total_N*D)}")        
     
     def forward(self,hidden_states,input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
+        t0 = time.time()
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        t1 = time.time()
+        print(f"[Engram] hash_mapping: {(t1 - t0) * 1000:.3f} ms")
+
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        t2 = time.time()
+        print(f"[Engram] embedding_lookup: {(t2 - t1) * 1000:.3f} ms")
+
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
@@ -372,9 +409,19 @@ class Engram(nn.Module):
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
             gate = gate.sigmoid().unsqueeze(-1)
             gates.append(gate)
+        t3 = time.time()
+        print(f"[Engram] gating_computation: {(t3 - t2) * 1000:.3f} ms")
+
         gates = torch.stack(gates,dim=2)
         value = gates * self.value_proj(embeddings).unsqueeze(2)
+        t4 = time.time()
+        print(f"[Engram] value_proj_and_apply: {(t4 - t3) * 1000:.3f} ms")
+
         output = value + self.short_conv(value)
+        t5 = time.time()
+        print(f"[Engram] short_conv_and_add: {(t5 - t4) * 1000:.3f} ms")
+        print(f"[Engram] total_forward: {(t5 - t0) * 1000:.3f} ms")
+
         return output 
 
 class TransformerBlock(nn.Module):
