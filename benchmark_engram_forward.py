@@ -155,6 +155,12 @@ def main() -> int:
     )
     p.add_argument("--dtype", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--layer-id", type=int, default=engram_cfg.layer_ids[0])
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size (B). Uses the same text repeated B times.",
+    )
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--runs", type=int, default=5)
     args = p.parse_args()
@@ -162,7 +168,7 @@ def main() -> int:
     log(
         "stage=begin "
         f"offline={int(args.offline)} dtype={args.dtype} layer_id={args.layer_id} "
-        f"warmup={args.warmup} runs={args.runs} "
+        f"batch_size={args.batch_size} warmup={args.warmup} runs={args.runs} "
     )
 
     if args.offline:
@@ -198,6 +204,9 @@ def main() -> int:
 
     log("stage=tokenize_begin")
     input_ids = tokenizer(text, return_tensors="pt").input_ids
+    if args.batch_size > 1:
+        # Repeat the same sequence across the batch dimension: [1,L] -> [B,L]
+        input_ids = input_ids.repeat(int(args.batch_size), 1)
     log(f"stage=tokenize_done input_ids.shape={tuple(input_ids.shape)}")
 
     log("stage=prepare_hidden_states_begin")
