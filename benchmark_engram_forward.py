@@ -153,7 +153,7 @@ def main() -> int:
         default=True,
         help="Avoid network calls to Hugging Face Hub (requires cached files).",
     )
-    p.add_argument("--dtype", choices=["fp32", "bf16"], default="bf16")
+    p.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default="bf16")
     p.add_argument("--layer-id", type=int, default=engram_cfg.layer_ids[0])
     p.add_argument(
         "--batch-size",
@@ -180,6 +180,10 @@ def main() -> int:
         dtype = torch.float32
     elif args.dtype == "bf16":
         dtype = torch.bfloat16
+    elif args.dtype == "fp16":
+        dtype = torch.float16
+    else:
+        raise ValueError(f"Unsupported dtype: {args.dtype}")
 
     # Build Engram module.
     log("stage=build_engram_begin")
