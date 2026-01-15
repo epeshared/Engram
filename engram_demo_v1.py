@@ -390,15 +390,8 @@ class Engram(nn.Module):
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        t0 = time.time()
         hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-        t1 = time.time()
-        print(f"[Engram] hash_mapping: {(t1 - t0) * 1000:.3f} ms")
-
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        t2 = time.time()
-        print(f"[Engram] embedding_lookup: {(t2 - t1) * 1000:.3f} ms")
-
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
@@ -409,19 +402,10 @@ class Engram(nn.Module):
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
             gate = gate.sigmoid().unsqueeze(-1)
             gates.append(gate)
-        t3 = time.time()
-        print(f"[Engram] gating_computation: {(t3 - t2) * 1000:.3f} ms")
 
         gates = torch.stack(gates,dim=2)
         value = gates * self.value_proj(embeddings).unsqueeze(2)
-        t4 = time.time()
-        print(f"[Engram] value_proj_and_apply: {(t4 - t3) * 1000:.3f} ms")
-
         output = value + self.short_conv(value)
-        t5 = time.time()
-        print(f"[Engram] short_conv_and_add: {(t5 - t4) * 1000:.3f} ms")
-        print(f"[Engram] total_forward: {(t5 - t0) * 1000:.3f} ms")
-
         return output 
 
 class TransformerBlock(nn.Module):
