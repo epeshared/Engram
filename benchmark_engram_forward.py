@@ -187,6 +187,7 @@ def main() -> int:
 
     # Build Engram module.
     log("stage=build_engram_begin")
+    
     engram = Engram(layer_id=args.layer_id).to(dtype=dtype)
     engram.eval()
     log("stage=build_engram_done")
@@ -224,11 +225,12 @@ def main() -> int:
     for i in range(warmup_n):
         if (i == 0) or (i == warmup_n - 1) or ((i + 1) % _progress_every(warmup_n) == 0):
             log(f"stage=warmup.step i={i+1}/{warmup_n}")
-        _ = engram_forward_profile(
-            engram,
-            hidden_states,
-            input_ids,
-        )
+        with torch.no_grad(),  torch.autocast('cpu', dtype=torch.bfloat16):
+            _ = engram_forward_profile(
+                engram,
+                hidden_states,
+                input_ids,
+            )
     if warmup_n > 0:
         log("stage=warmup.done")
 
@@ -241,7 +243,7 @@ def main() -> int:
     # os.system("emon -collect-edp > emon.dat &")
     for i in range(runs_n):
         if (i == 0) or (i == runs_n - 1) or ((i + 1) % _progress_every(runs_n) == 0):
-            log(f"stage=runs.step i={i+1}/{runs_n}")
+            log(f"stage=runs.step i={i+1}/{runs_n}")        
         r = engram_forward_profile(
             engram,
             hidden_states,

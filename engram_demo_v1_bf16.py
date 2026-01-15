@@ -78,8 +78,8 @@ def _suppress_stdout():
 class EngramConfig:
     # ~0.67B-ish scale demo config
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
-    engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])    
-    # engram_vocab_size: List[int] = field(default_factory=lambda: [129280 * 5, 129280 * 5])
+    # engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])    
+    engram_vocab_size: List[int] = field(default_factory=lambda: [129280 * 5, 129280 * 5])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
@@ -467,8 +467,7 @@ class Engram(nn.Module):
 
         value = gates * self.value_proj(embeddings).unsqueeze(2)
         t4 = time.time()
-        print(f"[Engram] value_proj_and_apply: {(t4 - t3) * 1000:.3f} ms")
-
+        print(f"[Engram] value_proj_and_apply: {(t4 - t3) * 1000:.3f} ms")        
         output = value + self.short_conv(value)
         t5 = time.time()
         print(f"[Engram] short_conv_and_add: {(t5 - t4) * 1000:.3f} ms")
@@ -496,7 +495,7 @@ class TransformerBlock(nn.Module):
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--dtype", choices=["fp32", "bf16"], default="bf16")
+    p.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default="bf16")
     p.add_argument(
         "--warmup",
         type=int,
@@ -527,18 +526,30 @@ def main() -> int:
 
     if args.dtype == "fp32":
         dtype = torch.float32
-    else:
+    elif args.dtype == "bf16":
         dtype = torch.bfloat16
+    elif args.dtype == "fp16":
+        dtype = torch.float16
+        if not torch.cuda.is_available():
+            print("[warn] fp16 on CPU may be slower/unsupported for some ops.")
+    else:
+        raise ValueError(f"Unsupported dtype: {args.dtype}")
 
-    model = nn.ModuleList(
-        [
-            nn.Embedding(backbone_config.vocab_size, backbone_config.hidden_size),
-            *[TransformerBlock(layer_id=layer_id, offline=args.offline) for layer_id in range(backbone_config.num_layers)],
-            nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size),
-        ]
-    )
+    # model = nn.ModuleList(
+    #     [
+    #         nn.Embedding(backbone_config.vocab_size, backbone_config.hidden_size),
+    #         *[TransformerBlock(layer_id=layer_id, offline=args.offline) for layer_id in range(backbone_config.num_layers)],
+    #         nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size),
+    #     ]
+    # )
 
-    model.to(dtype=dtype)
+    LLM = [
+        nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size),
+        *[TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)],
+        nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size)
+    ]    
+
+    # model.to(dtype=dtype)
 
     text = "Only Alexander the Great could tame the horse Bucephalus."
     tokenizer = AutoTokenizer.from_pretrained(
@@ -551,22 +562,23 @@ def main() -> int:
     def _forward_once() -> torch.Tensor:
         hidden_states = None
         output = None
-
-        for idx, layer in enumerate(model):
-            if idx == 0:
-                hidden_states = layer(input_ids)
-                # mock hyper-connection
-                hidden_states = (
-                    hidden_states.unsqueeze(2)
-                    .expand(-1, -1, backbone_config.hc_mult, -1)
-                    .contiguous()
-                )
-            elif idx == len(model) - 1:
-                # mock hyper-connection
-                hidden_states = hidden_states[:, :, 0, :]
-                output = layer(hidden_states)
-            else:
-                hidden_states = layer(input_ids=input_ids, hidden_states=hidden_states)
+        with torch.no_grad(),  torch.autocast('cpu', dtype=torch.bfloat16):
+            for idx, layer in enumerate(LLM):
+                if idx == 0:
+                    # hidden_states = layer(input_ids)
+                    hidden_states = LLM[0](input_ids)                    
+                    # mock hyper-connection
+                    hidden_states = (
+                        hidden_states.unsqueeze(2)
+                        .expand(-1, -1, backbone_config.hc_mult, -1)
+                        .contiguous()
+                    )
+                elif idx == len(LLM) - 1:
+                    # mock hyper-connection
+                    hidden_states = hidden_states[:, :, 0, :]
+                    output = layer(hidden_states)
+                else:
+                    hidden_states = layer(input_ids=input_ids, hidden_states=hidden_states)
 
         assert output is not None
         return output

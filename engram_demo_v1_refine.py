@@ -428,29 +428,84 @@ class TransformerBlock(nn.Module):
 
 if __name__ == '__main__':
     LLM = [
-        nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size),
-        *[TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)],
-        nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size)
+        nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size).eval(),
+        *[TransformerBlock(layer_id=layer_id).eval() for layer_id in range(backbone_config.num_layers)],
+        nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size).eval()
     ]
-
+ 
     text = "Only Alexander the Great could tame the horse Bucephalus."
     tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
     input_ids = tokenizer(text,return_tensors='pt').input_ids
-
+ 
     B,L = input_ids.shape
-
-    for idx, layer in enumerate(LLM):
-        if idx == 0:
-            hidden_states = LLM[0](input_ids)
-            ## mock hyper-connection
-            hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
-        elif idx == len(LLM)-1:
-            ## mock hyper-connection
-            hidden_states = hidden_states[:,:,0,:] 
-            output = layer(hidden_states)
-        else:
-            hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
-
+    loop = 100
+    
+    with torch.no_grad():
+        for i in range(3):  ## warm-up
+            for idx, layer in enumerate(LLM):
+                if idx == 0:
+                    hidden_states = LLM[0](input_ids)
+                    ## mock hyper-connection
+                    hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
+                elif idx == len(LLM)-1:
+                    ## mock hyper-connection
+                    hidden_states = hidden_states[:,:,0,:]
+                    output = layer(hidden_states)
+                else:
+                    hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+ 
+ 
+    start = time.perf_counter()
+    with torch.no_grad():
+        for i in range(loop):  ## warm-up
+            for idx, layer in enumerate(LLM):
+                if idx == 0:
+                    hidden_states = LLM[0](input_ids)
+                    ## mock hyper-connection
+                    hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
+                elif idx == len(LLM)-1:
+                    ## mock hyper-connection
+                    hidden_states = hidden_states[:,:,0,:]
+                    output = layer(hidden_states)
+                else:
+                    hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+    end = time.perf_counter()
+    print(f"⏱️ Inference F32 Time: {end - start:.4f} seconds")
+   
+    start = time.perf_counter()
+    with torch.no_grad(),  torch.autocast('cpu', dtype=torch.bfloat16):
+        for i in range(loop):  ## warm-up
+            for idx, layer in enumerate(LLM):
+                if idx == 0:
+                    hidden_states = LLM[0](input_ids)
+                    ## mock hyper-connection
+                    hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
+                elif idx == len(LLM)-1:
+                    ## mock hyper-connection
+                    hidden_states = hidden_states[:,:,0,:]
+                    output = layer(hidden_states)
+                else:
+                    hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+    end = time.perf_counter()
+    print(f"⏱️ Inference BF16 Time: {end - start:.4f} seconds")
+ 
+    start = time.perf_counter()
+    with torch.no_grad(),  torch.autocast('cpu', dtype=torch.float16):
+        for i in range(loop):  ## warm-up
+            for idx, layer in enumerate(LLM):
+                if idx == 0:
+                    hidden_states = LLM[0](input_ids)
+                    ## mock hyper-connection
+                    hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
+                elif idx == len(LLM)-1:
+                    ## mock hyper-connection
+                    hidden_states = hidden_states[:,:,0,:]
+                    output = layer(hidden_states)
+                else:
+                    hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+    end = time.perf_counter()
+    print(f"⏱️ Inference F16 Time: {end - start:.4f} seconds")
+ 
     print("✅ Forward Complete!")
-    print(f"{input_ids.shape=}\n{output.shape=}")
+ 
             
