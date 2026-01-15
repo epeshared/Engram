@@ -562,23 +562,22 @@ def main() -> int:
     def _forward_once() -> torch.Tensor:
         hidden_states = None
         output = None
-        with torch.no_grad(),  torch.autocast('cpu', dtype=torch.bfloat16):
-            for idx, layer in enumerate(LLM):
-                if idx == 0:
-                    # hidden_states = layer(input_ids)
-                    hidden_states = LLM[0](input_ids)                    
-                    # mock hyper-connection
-                    hidden_states = (
-                        hidden_states.unsqueeze(2)
-                        .expand(-1, -1, backbone_config.hc_mult, -1)
-                        .contiguous()
-                    )
-                elif idx == len(LLM) - 1:
-                    # mock hyper-connection
-                    hidden_states = hidden_states[:, :, 0, :]
-                    output = layer(hidden_states)
-                else:
-                    hidden_states = layer(input_ids=input_ids, hidden_states=hidden_states)
+        for idx, layer in enumerate(LLM):
+            if idx == 0:
+                # hidden_states = layer(input_ids)
+                hidden_states = LLM[0](input_ids)                    
+                # mock hyper-connection
+                hidden_states = (
+                    hidden_states.unsqueeze(2)
+                    .expand(-1, -1, backbone_config.hc_mult, -1)
+                    .contiguous()
+                )
+            elif idx == len(LLM) - 1:
+                # mock hyper-connection
+                hidden_states = hidden_states[:, :, 0, :]
+                output = layer(hidden_states)
+            else:
+                hidden_states = layer(input_ids=input_ids, hidden_states=hidden_states)
 
         assert output is not None
         return output

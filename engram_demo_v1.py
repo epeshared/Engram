@@ -195,7 +195,8 @@ class ShortConv(nn.Module):
         
         x_norm = torch.cat(normed_chunks, dim=-1)
         x_bct = x_norm.transpose(1, 2)
-        y_bct = self.conv(x_bct)
+        with torch.no_grad(),  torch.autocast('cpu', dtype=torch.bfloat16):
+            y_bct = self.conv(x_bct)
         y_bct = y_bct[..., :T]
 
         if self.activation:
