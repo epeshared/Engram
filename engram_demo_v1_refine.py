@@ -23,6 +23,7 @@ pip install torch numpy transformers sympy
 """
 
 ## built-in
+import argparse
 from typing import List
 from dataclasses import dataclass, field
 import math
@@ -427,6 +428,12 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch-size', type=int, default=1, help='Batch size (repeat the same text B times).')
+    parser.add_argument('--loop', type=int, default=100, help='Number of timed iterations.')
+    parser.add_argument('--warmup-iters', type=int, default=3, help='Number of warmup iterations.')
+    args = parser.parse_args()
+
     LLM = [
         nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size).eval(),
         *[TransformerBlock(layer_id=layer_id).eval() for layer_id in range(backbone_config.num_layers)],
@@ -436,12 +443,15 @@ if __name__ == '__main__':
     text = "Only Alexander the Great could tame the horse Bucephalus."
     tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
     input_ids = tokenizer(text,return_tensors='pt').input_ids
- 
+
+    if args.batch_size > 1:
+        input_ids = input_ids.repeat(int(args.batch_size), 1)
+
     B,L = input_ids.shape
-    loop = 100
+    loop = int(args.loop)
     
     with torch.no_grad():
-        for i in range(3):  ## warm-up
+        for i in range(int(args.warmup_iters)):  ## warm-up
             for idx, layer in enumerate(LLM):
                 if idx == 0:
                     hidden_states = LLM[0](input_ids)
