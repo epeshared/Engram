@@ -43,34 +43,34 @@ def human_format(num):
         num /= 1000.0
     return "{}{}".format('{:f}'.format(num).rstrip('0').rstrip('.'), ['', 'K', 'M', 'B', 'T'][magnitude])
 
-# @dataclass
-# class EngramConfig:
-#     # 100B级别配置
-#     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
-#     engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
-
-#     max_ngram_size: int = 3 
-#     n_embed_per_ngram: int = 512
-#     n_head_per_ngram: int = 8
-
-
-#     layer_ids: List[int] = field(default_factory=lambda: [1])  # 先只放 1 层，避免变成 200B
-#     pad_id: int = 2
-#     seed: int = 0
-#     kernel_size: int = 4
-
 @dataclass
 class EngramConfig:
-    # 0.67B级别配置
+    # 100B级别配置
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
-    engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
-    max_ngram_size: int = 3
+    engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
+
+    max_ngram_size: int = 3 
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
-    layer_ids: List[int] = field(default_factory=lambda: [1, 15])
+
+
+    layer_ids: List[int] = field(default_factory=lambda: [1]) 
     pad_id: int = 2
     seed: int = 0
     kernel_size: int = 4
+
+# @dataclass
+# class EngramConfig:
+#     # 0.67B级别配置
+#     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
+#     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
+#     max_ngram_size: int = 3
+#     n_embed_per_ngram: int = 512
+#     n_head_per_ngram: int = 8
+#     layer_ids: List[int] = field(default_factory=lambda: [1, 15])
+#     pad_id: int = 2
+#     seed: int = 0
+#     kernel_size: int = 4
     
 @dataclass
 class BackBoneConfig:
