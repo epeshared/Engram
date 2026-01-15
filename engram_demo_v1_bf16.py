@@ -78,8 +78,8 @@ def _suppress_stdout():
 class EngramConfig:
     # ~0.67B-ish scale demo config
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
-#   engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])    
-    engram_vocab_size: List[int] = field(default_factory=lambda: [129280 * 5, 129280 * 5])
+    engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])    
+    # engram_vocab_size: List[int] = field(default_factory=lambda: [129280 * 5, 129280 * 5])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
@@ -504,6 +504,12 @@ def _parse_args() -> argparse.Namespace:
         help="Number of silent warmup forwards before the measured run.",
     )
     p.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of measured forward passes to execute (with prints).",
+    )
+    p.add_argument(
         "--offline",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -571,8 +577,12 @@ def main() -> int:
             for _ in range(warmup_n):
                 _ = _forward_once()
 
+    runs_n = max(1, int(args.runs))
     with torch.no_grad():
-        output = _forward_once()
+        output = None
+        for _ in range(runs_n):
+            output = _forward_once()
+        assert output is not None
 
     print("✅ Forward Complete!")
     print(f"dtype={dtype} offline={args.offline}")
