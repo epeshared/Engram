@@ -43,22 +43,6 @@ def human_format(num):
         num /= 1000.0
     return "{}{}".format('{:f}'.format(num).rstrip('0').rstrip('.'), ['', 'K', 'M', 'B', 'T'][magnitude])
 
-# @dataclass
-# class EngramConfig:
-#     # 100B级别配置
-#     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
-#     engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
-
-#     max_ngram_size: int = 3 
-#     n_embed_per_ngram: int = 512
-#     n_head_per_ngram: int = 8
-
-
-#     layer_ids: List[int] = field(default_factory=lambda: [1]) 
-#     pad_id: int = 2
-#     seed: int = 0
-#     kernel_size: int = 4
-
 @dataclass
 class EngramConfig:
     # 0.67B级别配置
@@ -145,7 +129,11 @@ class CompressedTokenizer:
     
     def __call__(self, input_ids):
         return self._compress(input_ids)
-            
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class ShortConv(nn.Module):
     def __init__(
         self, 
@@ -194,9 +182,9 @@ class ShortConv(nn.Module):
             normed_chunks.append(self.norms[i](chunk))
         
         x_norm = torch.cat(normed_chunks, dim=-1)
-        x_bct = x_norm.transpose(1, 2)
-        with torch.no_grad(),  torch.autocast('cpu', dtype=torch.bfloat16):
-            y_bct = self.conv(x_bct)
+        x_bct = x_norm.transpose(1, 2)    
+        # with torch.no_grad(),  torch.autocast('cpu', dtype=torch.float16):    
+        y_bct = self.conv(x_bct)
         y_bct = y_bct[..., :T]
 
         if self.activation:
@@ -368,6 +356,7 @@ class Engram(nn.Module):
             list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
             D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram,
         )
+
         self.short_conv = ShortConv(
             hidden_size = backbone_config.hidden_size,
             kernel_size = engram_cfg.kernel_size,

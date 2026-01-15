@@ -133,7 +133,9 @@ def engram_forward_profile(
 
     # 6) ShortConv and residual-like add
     with timer.measure("short_conv"):
+        log("------->short_conv")        
         conv_out = engram.short_conv(value)
+        log("------->short_conv end")
 
     with timer.measure("add"):
         out = value + conv_out
