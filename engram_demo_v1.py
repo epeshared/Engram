@@ -47,8 +47,8 @@ def human_format(num):
 class EngramConfig:
     # 0.67B级别配置
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
-    # engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
-    engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
+    engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
+    # engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
