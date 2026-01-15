@@ -69,7 +69,7 @@ class EngramConfig:
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
-    layer_ids: List[int] = field(default_factory=lambda: [1, 15])
+    layer_ids: List[int] = field(default_factory=lambda: [1])
     pad_id: int = 2
     seed: int = 0
     kernel_size: int = 4
