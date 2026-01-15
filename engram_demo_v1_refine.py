@@ -434,6 +434,13 @@ if __name__ == '__main__':
     parser.add_argument('--warmup-iters', type=int, default=3, help='Number of warmup iterations.')
     args = parser.parse_args()
 
+    print(
+        "[args] "
+        f"batch_size={int(args.batch_size)} "
+        f"loop={int(args.loop)} "
+        f"warmup_iters={int(args.warmup_iters)}"
+    )
+
     LLM = [
         nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size).eval(),
         *[TransformerBlock(layer_id=layer_id).eval() for layer_id in range(backbone_config.num_layers)],
@@ -449,6 +456,8 @@ if __name__ == '__main__':
 
     B,L = input_ids.shape
     loop = int(args.loop)
+
+    print(f"[inputs] text_len_chars={len(text)} input_ids.shape={tuple(input_ids.shape)}")
     
     with torch.no_grad():
         for i in range(int(args.warmup_iters)):  ## warm-up
