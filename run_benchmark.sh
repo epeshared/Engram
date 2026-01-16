@@ -10,7 +10,7 @@ export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 # Default args (can be overridden by passing your own flags)
 DEFAULT_ARGS=(
   "--warmup" "1"
-  "--runs" "1000"
+  "--runs" "100"
 )
 
 PY_BIN="${ENGRAM_PYTHON:-}"
