@@ -60,8 +60,8 @@ class EngramConfig:
     
 @dataclass
 class BackBoneConfig:
-    # hidden_size: int = 1024
-    hidden_size: int = 1536
+    hidden_size: int = 1024
+    # hidden_size: int = 1536
     hc_mult: int = 4
     vocab_size: int = 129280
     num_layers: int = 30
@@ -185,8 +185,8 @@ class ShortConv(nn.Module):
         
         x_norm = torch.cat(normed_chunks, dim=-1)
         x_bct = x_norm.transpose(1, 2)    
-        with torch.no_grad(),  torch.autocast('cpu', dtype=torch.float16):    
-            y_bct = self.conv(x_bct)
+        # with torch.no_grad(),  torch.autocast('cpu', dtype=torch.float16):    
+        y_bct = self.conv(x_bct)
         y_bct = y_bct[..., :T]
 
         if self.activation:

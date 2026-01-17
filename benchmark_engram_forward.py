@@ -104,6 +104,8 @@ def engram_forward_profile(
         out_raw = engram.multi_head_embedding(hash_t)
         embeddings = out_raw.flatten(start_dim=-2)
 
+    # log(f"***** embeddings.shape={embeddings.shape}")
+
     # 4) Gates (accumulate across hc_mult)
     gates = []
     for hc_idx in range(backbone_config.hc_mult):
@@ -127,6 +129,7 @@ def engram_forward_profile(
     # 5) Value projection + apply gates
     with timer.measure("value_proj"):
         v = engram.value_proj(embeddings)
+        # log(f"***** v.shape={v.shape}")
 
     with timer.measure("apply_gates"):
         value = gates_t * v.unsqueeze(2)
