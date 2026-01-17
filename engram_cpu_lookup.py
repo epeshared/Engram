@@ -1,3 +1,26 @@
+"""
+Engram CPU-side lookup demo (standalone, config-driven + synthetic input).
+
+This file keeps ONLY the CPU work needed to produce Engram lookup embeddings:
+
+    hash_input_ids = torch.from_numpy(hash_mapping.hash(input_ids)[layer_id])
+    embeddings     = multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+
+Notes
+- Hashing is done with NumPy on CPU.
+- Embedding lookup is done with torch.nn.Embedding on CPU.
+- No gating / conv / transformer blocks are included.
+- Config is driven by EngramConfig / BackBoneConfig (no CLI for model hyperparams).
+
+Usage (synthetic, recommended for fixed shapes)
+    python engram_cpu_lookup.py \
+            --batch-size 32 --seq-len 1024 --layer-id 1 --runs 100
+
+Output
+- Prints hash_id tensor shape and embedding tensor shape.
+- Prints average time per run (hash + embedding lookup).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -25,14 +48,20 @@ def human_format(num: int) -> str:
     )
 
 
+def bytes_to_mib(num_bytes: int) -> float:
+    return float(num_bytes) / (1024.0 * 1024.0)
+
+
 # =========================
-# Configs (NEW)
+# Configs
 # =========================
 @dataclass
 class EngramConfig:
+    # 0.67B-level demo config (you can override these constants in code).
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
     # per n-gram order: for max_ngram_size=3 => [2-gram, 3-gram]
-    engram_vocab_size: List[int] = field(default_factory=lambda: [129280 * 5, 129280 * 5])
+    # engram_vocab_size: List[int] = field(default_factory=lambda: [129280 * 5, 129280 * 5])
+    engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
@@ -50,11 +79,14 @@ class BackBoneConfig:
     num_layers: int = 30
 
 
-# Instantiate configs here (no CLI needed)
+# Instantiate configs here (edit these values to match your target setup)
 engram_cfg = EngramConfig()
 backbone_cfg = BackBoneConfig()
 
 
+# =========================
+# Core logic (unchanged)
+# =========================
 class CompressedTokenizer:
     """Builds a surjective mapping old_token_id -> normalized_token_id."""
 
@@ -147,7 +179,7 @@ class NgramHashMapping:
         if len(self.vocab_size_per_ngram) != (self.max_ngram_size - 1):
             raise ValueError(
                 f"engram_vocab_size length must be max_ngram_size-1 "
-                f"({self.max_ngram_size-1}), got {len(self.vocab_size_per_ngram)}"
+                f"({self.max_ngram_size - 1}), got {len(self.vocab_size_per_ngram)}"
             )
 
         self.compressed_tokenizer = CompressedTokenizer(tokenizer_name_or_path=tokenizer_name_or_path)
@@ -258,24 +290,26 @@ def build_list_of_N(vocab_size_across_layers_for_one_layer: List[List[int]]) -> 
     return [x for heads in vocab_size_across_layers_for_one_layer for x in heads]
 
 
+# =========================
+# Main
+# =========================
 def main() -> None:
-    # Only keep runtime inputs here
     p = argparse.ArgumentParser()
-    p.add_argument("--text", default="Only Alexander the Great could tame the horse Bucephalus.")
     p.add_argument("--layer-id", type=int, default=1)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--runs", type=int, default=100)
+
+    # Synthetic input
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--seq-len", type=int, default=1024)
+
     args = p.parse_args()
 
-    # Use config-driven layer ids
+    # Config-driven layer ids
     layer_ids = list(engram_cfg.layer_ids)
     if args.layer_id not in layer_ids:
         raise SystemExit(f"--layer-id {args.layer_id} must be in engram_cfg.layer_ids={layer_ids}")
 
-    # Tokenizer: only used for tokenizing runtime text (compressed tokenizer is inside hash_mapping)
-    tok = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path, trust_remote_code=True)
-
-    # Use engram_cfg.engram_vocab_size directly (NO vocab_mult / NO recompute)
     hash_mapping = NgramHashMapping(
         engram_vocab_size=engram_cfg.engram_vocab_size,
         max_ngram_size=engram_cfg.max_ngram_size,
@@ -287,22 +321,58 @@ def main() -> None:
     )
 
     list_of_N = build_list_of_N(hash_mapping.vocab_size_across_layers[args.layer_id])
+    if engram_cfg.n_embed_per_ngram % engram_cfg.n_head_per_ngram != 0:
+        raise SystemExit(
+            f"n_embed_per_ngram({engram_cfg.n_embed_per_ngram}) must be divisible by "
+            f"n_head_per_ngram({engram_cfg.n_head_per_ngram})"
+        )
     D_head = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram
 
     mhe = MultiHeadEmbedding(list_of_N=list_of_N, D=D_head)
     mhe.eval()
 
-    total_N = sum(list_of_N)
+    # Parameter & memory stats (CPU-side lookup model = embedding tables + small buffers)
+    params_numel = int(sum(p.numel() for p in mhe.parameters()))
+    params_bytes = int(sum(p.numel() * p.element_size() for p in mhe.parameters()))
+    sd_bytes = 0
+    for v in mhe.state_dict().values():
+        if torch.is_tensor(v):
+            sd_bytes += int(v.numel() * v.element_size())
+
+    total_N = int(sum(list_of_N))
     print(
         f"[Init] layer_id={args.layer_id} tables={len(list_of_N)} total_N={human_format(total_N)} "
         f"D_head={D_head} params~={human_format(total_N * D_head)}"
     )
+    print(
+        f"[Params] numel={human_format(params_numel)} bytes={human_format(params_bytes)} "
+        f"({bytes_to_mib(params_bytes):.2f} MiB) state_dict={human_format(sd_bytes)} ({bytes_to_mib(sd_bytes):.2f} MiB)"
+    )
+    print(
+        f"[Cfg ] tokenizer={engram_cfg.tokenizer_name_or_path} "
+        f"max_ngram={engram_cfg.max_ngram_size} heads/ngram={engram_cfg.n_head_per_ngram} "
+        f"n_embed_per_ngram={engram_cfg.n_embed_per_ngram} layer_ids={engram_cfg.layer_ids} "
+        f"engram_vocab_size={engram_cfg.engram_vocab_size} seed={engram_cfg.seed} pad_id={engram_cfg.pad_id}"
+    )
 
-    encoded = tok(args.text, return_tensors="pt")
-    input_ids_pt = encoded.input_ids
+    tok = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path, trust_remote_code=True)
+    tok_vocab_size = len(tok)
+
+    # Build input_ids (synthetic only)
+    torch.manual_seed(int(engram_cfg.seed))
+    B, T = int(args.batch_size), int(args.seq_len)
+    input_ids_pt = torch.randint(
+        low=0,
+        high=tok_vocab_size,
+        size=(B, T),
+        dtype=torch.long,
+    )
+
     input_ids_np = input_ids_pt.numpy()
-
-    print(f"[Input] input_ids shape={tuple(input_ids_pt.shape)} seq_len={input_ids_pt.shape[1]}")
+    print(
+        f"[Input] input_ids shape={tuple(input_ids_pt.shape)} seq_len={input_ids_pt.shape[1]} "
+        f"synthetic=True"
+    )
 
     def one_pass() -> tuple[torch.Tensor, torch.Tensor]:
         hash_input_ids = torch.from_numpy(hash_mapping.hash(input_ids_np)[args.layer_id])
