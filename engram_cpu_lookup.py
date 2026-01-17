@@ -299,6 +299,14 @@ def main() -> None:
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--runs", type=int, default=100)
 
+    p.add_argument(
+        "--dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="Embedding table dtype (hash ids stay int64).",
+    )
+
     # Synthetic input
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--seq-len", type=int, default=1024)
@@ -329,6 +337,13 @@ def main() -> None:
     D_head = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram
 
     mhe = MultiHeadEmbedding(list_of_N=list_of_N, D=D_head)
+    if args.dtype == "fp16":
+        emb_dtype = torch.float16
+    elif args.dtype == "bf16":
+        emb_dtype = torch.bfloat16
+    else:
+        emb_dtype = torch.float32
+    mhe = mhe.to(dtype=emb_dtype)
     mhe.eval()
 
     # Parameter & memory stats (CPU-side lookup model = embedding tables + small buffers)
@@ -342,7 +357,7 @@ def main() -> None:
     total_N = int(sum(list_of_N))
     print(
         f"[Init] layer_id={args.layer_id} tables={len(list_of_N)} total_N={human_format(total_N)} "
-        f"D_head={D_head} params~={human_format(total_N * D_head)}"
+        f"D_head={D_head} params~={human_format(total_N * D_head)} dtype={args.dtype}"
     )
     print(
         f"[Params] numel={human_format(params_numel)} bytes={human_format(params_bytes)} "
@@ -355,8 +370,8 @@ def main() -> None:
         f"engram_vocab_size={engram_cfg.engram_vocab_size} seed={engram_cfg.seed} pad_id={engram_cfg.pad_id}"
     )
 
-    tok = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path, trust_remote_code=True)
-    tok_vocab_size = len(tok)
+    tok_vocab_size = len(hash_mapping.compressed_tokenizer.tokenizer)
+    print("token vocab size:", tok_vocab_size)
 
     # Build input_ids (synthetic only)
     torch.manual_seed(int(engram_cfg.seed))
