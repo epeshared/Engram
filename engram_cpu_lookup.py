@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import time
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -397,10 +398,12 @@ def main() -> None:
     for _ in range(max(0, args.warmup)):
         _ = one_pass()
 
-    t0 = time.perf_counter()
+    # os.system("emon -collect-edp > emon.dat &")
+    t0 = time.perf_counter()    
     for _ in range(max(1, args.runs)):
         hash_ids, emb = one_pass()
     t1 = time.perf_counter()
+    # os.system("emon -stop")
 
     dt_ms = (t1 - t0) * 1000.0 / max(1, args.runs)
 
