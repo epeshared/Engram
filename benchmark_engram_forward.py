@@ -166,6 +166,15 @@ def main() -> int:
         default=1,
         help="Batch size (B). Uses the same text repeated B times.",
     )
+    p.add_argument(
+        "--token-len",
+        type=int,
+        default=0,
+        help=(
+            "If >0, generate random token ids of exactly this length and decode them to a random text. "
+            "The benchmark then uses the generated token ids directly (stable length)."
+        ),
+    )
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--runs", type=int, default=5)
     args = p.parse_args()
@@ -212,12 +221,35 @@ def main() -> int:
     )
     log("stage=tokenizer.load_done")
 
-    log("stage=tokenize_begin")
-    input_ids = tokenizer(text, return_tensors="pt").input_ids
-    if args.batch_size > 1:
-        # Repeat the same sequence across the batch dimension: [1,L] -> [B,L]
-        input_ids = input_ids.repeat(int(args.batch_size), 1)
-    log(f"stage=tokenize_done input_ids.shape={tuple(input_ids.shape)}")
+    if int(args.token_len) > 0:
+        # Random tokens -> decode to random text (for printing / reproducibility),
+        # but use token ids directly to guarantee exact length.
+        tok_vocab_size = int(getattr(tokenizer, "vocab_size", len(tokenizer)))
+        if tok_vocab_size <= 0:
+            raise RuntimeError(f"Invalid tokenizer vocab size: {tok_vocab_size}")
+
+        log(f"stage=random_tokens_begin token_len={int(args.token_len)}")
+        torch.manual_seed(0)
+        input_ids = torch.randint(
+            low=0,
+            high=tok_vocab_size,
+            size=(1, int(args.token_len)),
+            dtype=torch.long,
+        )
+        text = tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=False)
+        if args.batch_size > 1:
+            input_ids = input_ids.repeat(int(args.batch_size), 1)
+        log(
+            f"stage=random_tokens_done input_ids.shape={tuple(input_ids.shape)} "
+            f"text_chars={len(text)}"
+        )
+    else:
+        log("stage=tokenize_begin")
+        input_ids = tokenizer(text, return_tensors="pt").input_ids
+        if args.batch_size > 1:
+            # Repeat the same sequence across the batch dimension: [1,L] -> [B,L]
+            input_ids = input_ids.repeat(int(args.batch_size), 1)
+        log(f"stage=tokenize_done input_ids.shape={tuple(input_ids.shape)}")
 
     log("stage=prepare_hidden_states_begin")
     hidden_states = _prepare_hidden_states_from_text(input_ids, dtype=dtype)
