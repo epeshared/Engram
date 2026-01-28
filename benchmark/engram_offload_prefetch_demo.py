@@ -174,6 +174,16 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default) in {"1", "true", "True", "yes", "YES"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 _TIMELINE_ENABLED = _env_flag("ENGRAM_TIMELINE", "0")
 _TIMELINE_VERBOSE = _env_flag("ENGRAM_TIMELINE_VERBOSE", "0")
 _TIMELINE_START_NS = time.perf_counter_ns()
@@ -303,6 +313,52 @@ def _load_tokenizer(tokenizer_name_or_path: str):
 if _env_flag("ENGRAM_DEMO_SMALL", "0"):
     # Roughly "a few tokenizer vocab" per (n,k) head.
     engram_cfg.engram_vocab_size = [engram_cfg.engram_vocab_size[0] // 100, engram_cfg.engram_vocab_size[1] // 100]
+
+
+def _simulate_block_compute(hidden_states: torch.Tensor, sim_ms: float, *, layer_id: Optional[int] = None) -> None:
+    """Simulate compute for a Transformer block without Engram.
+
+    - CPU: sleeps for sim_ms.
+    - CUDA: enqueues a CUDA sleep kernel (no host-side blocking) when available.
+
+    This is intended for benchmarking overlap between CPU retrieval and backbone compute.
+    """
+    sim_ms = float(sim_ms)
+    if sim_ms <= 0.0:
+        return
+
+    dev = hidden_states.device
+    if dev.type == "cuda" and torch.cuda.is_available():
+        # Prefer torch.cuda._sleep when available because it enqueues on the current stream
+        # and approximates a fixed duration without synchronizing.
+        if hasattr(torch.cuda, "_sleep"):
+            props = torch.cuda.get_device_properties(dev)
+            # props.clock_rate is in kHz (cycles/ms), so cycles ~= ms * clock_rate.
+            cycles = int(sim_ms * float(props.clock_rate))
+            cycles = max(1, cycles)
+            if _TIMELINE_VERBOSE:
+                tlog(f"block.sim_compute.cuda_sleep.begin ms={sim_ms:.3f} cycles={cycles}", layer_id=layer_id)
+            with torch.cuda.device(dev.index if dev.index is not None else torch.cuda.current_device()):
+                torch.cuda._sleep(cycles)
+            if _TIMELINE_VERBOSE:
+                tlog("block.sim_compute.cuda_sleep.enqueued", layer_id=layer_id)
+        else:
+            # Fallback: run a small op. Duration is approximate.
+            if _TIMELINE_VERBOSE:
+                tlog(f"block.sim_compute.fallback_op.begin ms={sim_ms:.3f}", layer_id=layer_id)
+            x = hidden_states
+            for _ in range(max(1, int(sim_ms))):
+                x = x + 1
+            if _TIMELINE_VERBOSE:
+                tlog("block.sim_compute.fallback_op.done", layer_id=layer_id)
+        return
+
+    # CPU fallback: host-side sleep.
+    if _TIMELINE_VERBOSE:
+        tlog(f"block.sim_compute.cpu_sleep.begin ms={sim_ms:.3f}", layer_id=layer_id)
+    time.sleep(sim_ms / 1000.0)
+    if _TIMELINE_VERBOSE:
+        tlog("block.sim_compute.cpu_sleep.done", layer_id=layer_id)
 
 class CompressedTokenizer:
     def __init__(
@@ -844,6 +900,7 @@ class TransformerBlock(nn.Module):
         if layer_id in engram_cfg.layer_ids:
             self.engram = Engram(layer_id=layer_id)
         self.layer_id = int(layer_id)
+        self.non_engram_sim_ms: float = 0.0
     
     def forward(self, input_ids: torch.Tensor, hidden_states: torch.Tensor, *, prefetcher: Optional[EngramPrefetcher] = None, input_ids_cpu: Optional[torch.Tensor] = None):
         if self.engram is not None:
@@ -863,6 +920,9 @@ class TransformerBlock(nn.Module):
                 tlog("block.engram.no_prefetch.cpu_retrieve", layer_id=self.layer_id)
                 hidden_states = self.engram(hidden_states=hidden_states, input_ids_cpu=input_ids_cpu) + hidden_states
             tlog("block.engram.exit", layer_id=self.layer_id)
+        else:
+            # Simulate backbone compute cost for blocks without Engram.
+            _simulate_block_compute(hidden_states, self.non_engram_sim_ms, layer_id=self.layer_id)
 
         if _TIMELINE_VERBOSE:
             tlog("block.attn", layer_id=self.layer_id)
@@ -875,7 +935,12 @@ class TransformerBlock(nn.Module):
 
 
 class DemoLLM(nn.Module):
-    def __init__(self, *, cpu_retrieval_dtype: torch.dtype = torch.float16):
+    def __init__(
+        self,
+        *,
+        cpu_retrieval_dtype: torch.dtype = torch.float16,
+        non_engram_block_sim_ms: float = 0.0,
+    ):
         super().__init__()
         self.tok_emb = nn.Embedding(backbone_config.vocab_size, backbone_config.hidden_size)
         self.blocks = nn.ModuleList([TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)])
@@ -883,6 +948,8 @@ class DemoLLM(nn.Module):
         for blk in self.blocks:
             if getattr(blk, "engram", None) is not None:
                 blk.engram.cpu.cpu_dtype = cpu_retrieval_dtype
+            else:
+                blk.non_engram_sim_ms = float(non_engram_block_sim_ms)
         self.lm_head = nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size)
 
     def build_prefetcher(self, device: torch.device) -> Optional[EngramPrefetcher]:
@@ -937,6 +1004,13 @@ if __name__ == '__main__':
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--non-engram-block-sim-ms",
+        type=float,
+        default=_env_float("ENGRAM_NON_ENGRAM_BLOCK_SIM_MS", 0.0),
+        help="Simulated compute time (ms) for Transformer blocks that do NOT contain Engram. "
+        "(env: ENGRAM_NON_ENGRAM_BLOCK_SIM_MS)",
+    )
     args = parser.parse_args()
 
     tokenizer = _load_tokenizer(engram_cfg.tokenizer_name_or_path)
@@ -947,7 +1021,10 @@ if __name__ == '__main__':
         print("[WARN] CUDA not available; running everything on CPU (no overlap demo).")
 
     # Build model: backbone on GPU, Engram retrieval stays on CPU.
-    model = DemoLLM(cpu_retrieval_dtype=torch.float16)
+    model = DemoLLM(
+        cpu_retrieval_dtype=torch.float16,
+        non_engram_block_sim_ms=args.non_engram_block_sim_ms,
+    )
     model = model.to(device)
     model.eval()
 

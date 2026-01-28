@@ -7,4 +7,4 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 # TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 ENGRAM_TIMELINE=1  python engram_offload_prefetch_demo.py 
 
 # random input
-ENGRAM_TIMELINE=1  python engram_offload_prefetch_demo.py --only-random --batch-size 30 --seq-len 100 --seed 123
+ENGRAM_TIMELINE=1  python engram_offload_prefetch_demo.py --non-engram-block-sim-ms 10 --only-random --batch-size 30 --seq-len 100 --seed 123
