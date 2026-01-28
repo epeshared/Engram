@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 import os
 import math
 import time
+import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, Optional, Tuple
 import threading
@@ -61,6 +62,35 @@ def record_retrieve_tot_ms(layer_id: int, tot_ms: float) -> None:
 def get_retrieve_tot_ms() -> Dict[int, float]:
     with _RETRIEVE_STATS_LOCK:
         return dict(_RETRIEVE_TOT_MS)
+
+
+def _make_random_input_ids(
+    *,
+    tokenizer,
+    batch_size: int,
+    seq_len: int,
+    seed: int,
+) -> torch.Tensor:
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be > 0, got {seq_len}")
+
+    # Engram hashing path expects IDs compatible with the tokenizer.
+    # Also keep within backbone embedding vocab.
+    vocab_limit = int(min(backbone_config.vocab_size, len(tokenizer)))
+    if vocab_limit <= 0:
+        raise RuntimeError(f"Invalid vocab_limit={vocab_limit}")
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed))
+    return torch.randint(
+        low=0,
+        high=vocab_limit,
+        size=(int(batch_size), int(seq_len)),
+        dtype=torch.long,
+        generator=g,
+    )
 
 
 def _is_probable_prime_u64(n: int) -> bool:
@@ -842,10 +872,29 @@ class DemoLLM(nn.Module):
         return logits
 
 if __name__ == '__main__':
-    reset_retrieve_stats()
-    text = "Only Alexander the Great could tame the horse Bucephalus."
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--text",
+        type=str,
+        default="Only Alexander the Great could tame the horse Bucephalus.",
+        help="Text prompt to run (default: demo sentence).",
+    )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="Also run a random fixed-length batch (token IDs) for benchmarking.",
+    )
+    parser.add_argument(
+        "--only-random",
+        action="store_true",
+        help="Run only the random batch; skip the fixed text prompt.",
+    )
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
     tokenizer = _load_tokenizer(engram_cfg.tokenizer_name_or_path)
-    input_ids_cpu = tokenizer(text, return_tensors='pt').input_ids
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tlog(f"main.device {device}")
@@ -857,39 +906,69 @@ if __name__ == '__main__':
     model = model.to(device)
     model.eval()
 
-    # Schedule CPU retrieval in background threads (paper-like deterministic prefetch).
-    prefetcher = model.build_prefetcher(device=device)
-    if prefetcher is not None:
-        tlog("main.prefetcher.start")
-        prefetcher.start(input_ids_cpu)
+    def run_case(case_name: str, input_ids_cpu: torch.Tensor, *, meta: str) -> None:
+        reset_retrieve_stats()
+        print(f"\n=== CASE: {case_name} ===\n{meta}", flush=True)
+        print(f"input_ids_cpu.shape={tuple(input_ids_cpu.shape)} dtype={input_ids_cpu.dtype}", flush=True)
 
-    input_ids = input_ids_cpu.to(device)
+        # Schedule CPU retrieval in background threads (paper-like deterministic prefetch).
+        prefetcher = model.build_prefetcher(device=device)
+        try:
+            if prefetcher is not None:
+                tlog("main.prefetcher.start")
+                prefetcher.start(input_ids_cpu)
 
-    with torch.no_grad():
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        t_fwd0_ns = time.perf_counter_ns()
-        logits = model(input_ids, prefetcher=prefetcher, input_ids_cpu=input_ids_cpu)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        t_fwd1_ns = time.perf_counter_ns()
+            input_ids = input_ids_cpu.to(device)
 
-    if prefetcher is not None:
-        tlog("main.prefetcher.shutdown")
-        prefetcher.shutdown()
+            with torch.no_grad():
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                t_fwd0_ns = time.perf_counter_ns()
+                logits = model(input_ids, prefetcher=prefetcher, input_ids_cpu=input_ids_cpu)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                t_fwd1_ns = time.perf_counter_ns()
+        finally:
+            if prefetcher is not None:
+                tlog("main.prefetcher.shutdown")
+                prefetcher.shutdown()
 
-    forward_ms = (t_fwd1_ns - t_fwd0_ns) / 1e6
+        forward_ms = (t_fwd1_ns - t_fwd0_ns) / 1e6
+        per_layer = get_retrieve_tot_ms()
+        sum_tot_ms = float(sum(per_layer.values()))
+        pct = (sum_tot_ms / forward_ms * 100.0) if forward_ms > 0 else float('nan')
+        layer_parts = " ".join([f"layer{lid}={per_layer[lid]:.3f}ms" for lid in sorted(per_layer.keys())])
+        print(
+            f"[TIME] forward_ms={forward_ms:.3f} cpu_retrieve_tot=({layer_parts}) "
+            f"cpu_retrieve_sum_ms={sum_tot_ms:.3f} cpu_retrieve_sum_pct={pct:.2f}%",
+            flush=True,
+        )
+        print("✅ Forward Complete!", flush=True)
+        print(f"input_ids.shape={tuple(input_ids.shape)} logits.shape={tuple(logits.shape)}", flush=True)
 
-    per_layer = get_retrieve_tot_ms()
-    sum_tot_ms = float(sum(per_layer.values()))
-    pct = (sum_tot_ms / forward_ms * 100.0) if forward_ms > 0 else float('nan')
-    layer_parts = " ".join([f"layer{lid}={per_layer[lid]:.3f}ms" for lid in sorted(per_layer.keys())])
-    print(
-        f"[TIME] forward_ms={forward_ms:.3f} cpu_retrieve_tot=({layer_parts}) "
-        f"cpu_retrieve_sum_ms={sum_tot_ms:.3f} cpu_retrieve_sum_pct={pct:.2f}%",
-        flush=True,
-    )
+    if not args.only_random:
+        text = args.text
+        input_ids_cpu_text = tokenizer(text, return_tensors="pt").input_ids
+        run_case(
+            "text",
+            input_ids_cpu_text,
+            meta=f"text={text!r}",
+        )
 
-    print("✅ Forward Complete!")
-    print(f"{input_ids.shape=}\n{logits.shape=}")
+    if args.random or args.only_random:
+        input_ids_cpu_rand = _make_random_input_ids(
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            seed=args.seed,
+        )
+        preview = input_ids_cpu_rand[0, : min(16, input_ids_cpu_rand.shape[1])].tolist()
+        run_case(
+            "random",
+            input_ids_cpu_rand,
+            meta=(
+                f"batch_size={args.batch_size} seq_len={args.seq_len} seed={args.seed} "
+                f"vocab_limit={int(min(backbone_config.vocab_size, len(tokenizer)))} first_ids={preview}"
+            ),
+        )
             
