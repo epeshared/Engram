@@ -25,6 +25,7 @@ pip install torch numpy transformers sympy
 ## built-in
 from typing import List
 from dataclasses import dataclass, field
+import os
 import math
 import time
 
@@ -74,7 +75,15 @@ class CompressedTokenizer:
         self,
         tokenizer_name_or_path,
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
+        offline = (
+            os.environ.get("TRANSFORMERS_OFFLINE") in {"1", "true", "True"}
+            or os.environ.get("HF_HUB_OFFLINE") in {"1", "true", "True"}
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            trust_remote_code=True,
+            local_files_only=offline,
+        )
         
         SENTINEL = "\uE000"
         self.normalizer = normalizers.Sequence([
