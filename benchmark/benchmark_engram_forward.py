@@ -21,7 +21,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 # Import the demo definitions.
-from engram_demo_v1 import Engram, MultiHeadEmbedding, engram_cfg, backbone_config
+from engram_offload_prefetch_demo import Engram, MultiHeadEmbedding, engram_cfg, backbone_config
 from transformers import AutoTokenizer
 
 
