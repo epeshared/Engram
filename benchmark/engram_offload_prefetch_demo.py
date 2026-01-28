@@ -233,6 +233,45 @@ def _hf_offline() -> bool:
     )
 
 
+class _DummyTokenizer:
+    """Minimal tokenizer fallback for offline benchmarking.
+
+    This avoids hard-failing when HF assets are not cached and networking is disabled.
+    It is NOT equivalent to the real tokenizer; it's just enough to run the demo/benchmarks.
+    """
+
+    def __init__(self, vocab_size: int):
+        self._vocab_size = int(vocab_size)
+
+    def __len__(self) -> int:
+        return self._vocab_size
+
+    def decode(self, ids, skip_special_tokens: bool = False):
+        # Return a deterministic string per id.
+        if isinstance(ids, (list, tuple)) and len(ids) > 0:
+            tid = int(ids[0])
+        else:
+            tid = int(ids)
+        return f"tok{tid}"
+
+    def convert_ids_to_tokens(self, tid: int):
+        return f"tok{int(tid)}"
+
+    def __call__(self, text: str, return_tensors: str = "pt"):
+        # Simple whitespace split + stable hash to ids.
+        toks = (text or "").strip().split()
+        if not toks:
+            toks = ["_"]
+        ids = [abs(hash(t)) % self._vocab_size for t in toks]
+        input_ids = torch.tensor([ids], dtype=torch.long)
+
+        class _Out:
+            def __init__(self, input_ids):
+                self.input_ids = input_ids
+
+        return _Out(input_ids)
+
+
 def _load_tokenizer(tokenizer_name_or_path: str):
     """Load HF tokenizer with a robust offline fallback."""
     offline = _hf_offline()
@@ -244,7 +283,13 @@ def _load_tokenizer(tokenizer_name_or_path: str):
         )
     except Exception as e:
         if offline:
-            raise
+            # Offline + not cached: fall back to a minimal local tokenizer so benchmarks can run.
+            print(
+                f"[WARN] Tokenizer '{tokenizer_name_or_path}' not found in local cache and offline mode is enabled; "
+                f"falling back to DummyTokenizer(vocab_size={backbone_config.vocab_size}).",
+                flush=True,
+            )
+            return _DummyTokenizer(vocab_size=backbone_config.vocab_size)
         # If networking is blocked, retry in offline mode.
         return AutoTokenizer.from_pretrained(
             tokenizer_name_or_path,

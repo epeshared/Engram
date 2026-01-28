@@ -1,0 +1,14 @@
+# GPU requirements for benchmark/ scripts
+# Install (pick the CUDA wheel index-url that matches your system):
+#   CUDA 12.1 (common): pip install -r benchmark/requirements-gpu.txt
+#   CUDA 11.8:         edit the index-url to https://download.pytorch.org/whl/cu118
+# Docs: https://pytorch.org/get-started/locally/
+
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+
+torch
+numpy
+transformers
+tokenizers
+

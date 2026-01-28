@@ -1,0 +1,11 @@
+# CPU-only requirements for benchmark/ scripts
+# Install:
+#   pip install -r benchmark/requirements-cpu.txt
+
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+torch
+numpy
+transformers
+tokenizers
