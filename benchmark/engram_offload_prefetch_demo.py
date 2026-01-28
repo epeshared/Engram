@@ -48,10 +48,18 @@ from tokenizers import normalizers, Regex
 _RETRIEVE_STATS_LOCK = threading.Lock()
 _RETRIEVE_TOT_MS: Dict[int, float] = {}
 
+_WAIT_STATS_LOCK = threading.Lock()
+_WAIT_CPU_FUTURE_MS: Dict[int, float] = {}
+
 
 def reset_retrieve_stats() -> None:
     with _RETRIEVE_STATS_LOCK:
         _RETRIEVE_TOT_MS.clear()
+
+
+def reset_wait_stats() -> None:
+    with _WAIT_STATS_LOCK:
+        _WAIT_CPU_FUTURE_MS.clear()
 
 
 def record_retrieve_tot_ms(layer_id: int, tot_ms: float) -> None:
@@ -62,6 +70,16 @@ def record_retrieve_tot_ms(layer_id: int, tot_ms: float) -> None:
 def get_retrieve_tot_ms() -> Dict[int, float]:
     with _RETRIEVE_STATS_LOCK:
         return dict(_RETRIEVE_TOT_MS)
+
+
+def record_wait_cpu_future_ms(layer_id: int, wait_ms: float) -> None:
+    with _WAIT_STATS_LOCK:
+        _WAIT_CPU_FUTURE_MS[int(layer_id)] = float(wait_ms)
+
+
+def get_wait_cpu_future_ms() -> Dict[int, float]:
+    with _WAIT_STATS_LOCK:
+        return dict(_WAIT_CPU_FUTURE_MS)
 
 
 def _make_random_input_ids(
@@ -826,7 +844,11 @@ class EngramPrefetcher:
         emb_cpu: torch.Tensor = fut.result()
         if waited:
             wait_ms = (time.perf_counter_ns() - t_wait0) / 1e6
+            record_wait_cpu_future_ms(layer_id, wait_ms)
             tlog(f"prefetch.wait_cpu_future.done wait_ms={wait_ms:.3f}", layer_id=layer_id)
+        else:
+            # Do not record anything: missing key => zero blocking wait for this layer.
+            pass
 
         nbytes = int(emb_cpu.numel() * emb_cpu.element_size())
         tlog(
@@ -1030,6 +1052,7 @@ if __name__ == '__main__':
 
     def run_case(case_name: str, input_ids_cpu: torch.Tensor, *, meta: str) -> None:
         reset_retrieve_stats()
+        reset_wait_stats()
         print(f"\n=== CASE: {case_name} ===\n{meta}", flush=True)
         print(f"input_ids_cpu.shape={tuple(input_ids_cpu.shape)} dtype={input_ids_cpu.dtype}", flush=True)
 
@@ -1056,13 +1079,20 @@ if __name__ == '__main__':
                 prefetcher.shutdown()
 
         forward_ms = (t_fwd1_ns - t_fwd0_ns) / 1e6
-        per_layer = get_retrieve_tot_ms()
-        sum_tot_ms = float(sum(per_layer.values()))
-        pct = (sum_tot_ms / forward_ms * 100.0) if forward_ms > 0 else float('nan')
-        layer_parts = " ".join([f"layer{lid}={per_layer[lid]:.3f}ms" for lid in sorted(per_layer.keys())])
+        per_layer_retrieve = get_retrieve_tot_ms()
+        per_layer_wait = get_wait_cpu_future_ms()
+
+        # Only count *blocking* wait in the sum/pct, because non-waited layers are overlapped.
+        sum_wait_ms = float(sum(per_layer_wait.values()))
+        pct = (sum_wait_ms / forward_ms * 100.0) if forward_ms > 0 else float('nan')
+
+        retrieve_parts = " ".join(
+            [f"layer{lid}={per_layer_retrieve[lid]:.3f}ms" for lid in sorted(per_layer_retrieve.keys())]
+        )
+        wait_parts = " ".join([f"layer{lid}={per_layer_wait[lid]:.3f}ms" for lid in sorted(per_layer_wait.keys())])
         print(
-            f"[TIME] forward_ms={forward_ms:.3f} cpu_retrieve_tot=({layer_parts}) "
-            f"cpu_retrieve_sum_ms={sum_tot_ms:.3f} cpu_retrieve_sum_pct={pct:.2f}%",
+            f"[TIME] forward_ms={forward_ms:.3f} cpu_retrieve_tot=({retrieve_parts}) "
+            f"cpu_wait_cpu_future_ms=({wait_parts}) cpu_wait_sum_ms={sum_wait_ms:.3f} cpu_wait_sum_pct={pct:.2f}%",
             flush=True,
         )
         print("✅ Forward Complete!", flush=True)
