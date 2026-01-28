@@ -44,6 +44,25 @@ from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex 
 
 
+_RETRIEVE_STATS_LOCK = threading.Lock()
+_RETRIEVE_TOT_MS: Dict[int, float] = {}
+
+
+def reset_retrieve_stats() -> None:
+    with _RETRIEVE_STATS_LOCK:
+        _RETRIEVE_TOT_MS.clear()
+
+
+def record_retrieve_tot_ms(layer_id: int, tot_ms: float) -> None:
+    with _RETRIEVE_STATS_LOCK:
+        _RETRIEVE_TOT_MS[int(layer_id)] = float(tot_ms)
+
+
+def get_retrieve_tot_ms() -> Dict[int, float]:
+    with _RETRIEVE_STATS_LOCK:
+        return dict(_RETRIEVE_TOT_MS)
+
+
 def _is_probable_prime_u64(n: int) -> bool:
     """Deterministic Miller-Rabin for 64-bit integers."""
     if n < 2:
@@ -555,11 +574,13 @@ class EngramCpuRetriever:
                 pass
 
         t1_ns = time.perf_counter_ns()
+        tot_ms = (t1_ns - t0_ns) / 1e6
+        record_retrieve_tot_ms(self.layer_id, tot_ms)
         tlog(
             "cpu.retrieve.done "
             f"hash={(t_hash1 - t_hash0) / 1e6:.3f}ms "
             f"emb={(t_emb1 - t_emb0) / 1e6:.3f}ms "
-            f"tot={(t1_ns - t0_ns) / 1e6:.3f}ms "
+            f"tot={tot_ms:.3f}ms "
             f"out={tuple(emb.shape)} pin={getattr(emb, 'is_pinned', lambda: False)()}",
             layer_id=self.layer_id,
         )
@@ -666,12 +687,20 @@ class EngramPrefetcher:
         if layer_id not in self.futures:
             raise KeyError(f"No prefetch scheduled for layer_id={layer_id}")
 
-        tlog("prefetch.wait_cpu_future.begin", layer_id=layer_id)
-        emb_cpu: torch.Tensor = self.futures[layer_id].result()
+        fut = self.futures[layer_id]
+        waited = not fut.done()
+        if waited:
+            tlog("prefetch.wait_cpu_future.begin", layer_id=layer_id)
+            t_wait0 = time.perf_counter_ns()
+        emb_cpu: torch.Tensor = fut.result()
+        if waited:
+            wait_ms = (time.perf_counter_ns() - t_wait0) / 1e6
+            tlog(f"prefetch.wait_cpu_future.done wait_ms={wait_ms:.3f}", layer_id=layer_id)
+
         nbytes = int(emb_cpu.numel() * emb_cpu.element_size())
         tlog(
-            "prefetch.wait_cpu_future.done "
-            f"cpu_shape={tuple(emb_cpu.shape)} "
+            "prefetch.cpu_embedding "
+            f"shape={tuple(emb_cpu.shape)} "
             f"dtype={str(emb_cpu.dtype).replace('torch.', '')} "
             f"bytes={_format_bytes(nbytes)}",
             layer_id=layer_id,
@@ -813,6 +842,7 @@ class DemoLLM(nn.Module):
         return logits
 
 if __name__ == '__main__':
+    reset_retrieve_stats()
     text = "Only Alexander the Great could tame the horse Bucephalus."
     tokenizer = _load_tokenizer(engram_cfg.tokenizer_name_or_path)
     input_ids_cpu = tokenizer(text, return_tensors='pt').input_ids
@@ -836,11 +866,29 @@ if __name__ == '__main__':
     input_ids = input_ids_cpu.to(device)
 
     with torch.no_grad():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_fwd0_ns = time.perf_counter_ns()
         logits = model(input_ids, prefetcher=prefetcher, input_ids_cpu=input_ids_cpu)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t_fwd1_ns = time.perf_counter_ns()
 
     if prefetcher is not None:
         tlog("main.prefetcher.shutdown")
         prefetcher.shutdown()
+
+    forward_ms = (t_fwd1_ns - t_fwd0_ns) / 1e6
+
+    per_layer = get_retrieve_tot_ms()
+    sum_tot_ms = float(sum(per_layer.values()))
+    pct = (sum_tot_ms / forward_ms * 100.0) if forward_ms > 0 else float('nan')
+    layer_parts = " ".join([f"layer{lid}={per_layer[lid]:.3f}ms" for lid in sorted(per_layer.keys())])
+    print(
+        f"[TIME] forward_ms={forward_ms:.3f} cpu_retrieve_tot=({layer_parts}) "
+        f"cpu_retrieve_sum_ms={sum_tot_ms:.3f} cpu_retrieve_sum_pct={pct:.2f}%",
+        flush=True,
+    )
 
     print("✅ Forward Complete!")
     print(f"{input_ids.shape=}\n{logits.shape=}")
