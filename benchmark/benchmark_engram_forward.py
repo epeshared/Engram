@@ -90,7 +90,7 @@ def engram_forward_profile(
 
     # 1) Hashing (CPU / NumPy)
     with timer.measure("hash_mapping.hash (cpu)"):
-        hash_dict = engram.hash_mapping.hash(input_ids)
+        hash_dict = engram.cpu.hash_mapping.hash(input_ids)
         hash_np = hash_dict[engram.layer_id]  # [B,L,H]
 
     # 2) NumPy -> Torch
@@ -101,8 +101,13 @@ def engram_forward_profile(
     # 3) Embedding lookup + flatten
     with timer.measure("multi_head_embedding + flatten"):
         # Just use the component which might be virtual or real.
-        out_raw = engram.multi_head_embedding(hash_t)
+        out_raw = engram.cpu.multi_head_embedding(hash_t)
         embeddings = out_raw.flatten(start_dim=-2)
+
+    # Match demo fusion behavior: cast embeddings to hidden_states dtype.
+    if embeddings.dtype != hidden_states.dtype:
+        with timer.measure("embeddings.cast"):
+            embeddings = embeddings.to(dtype=hidden_states.dtype)
 
     # log(f"***** embeddings.shape={embeddings.shape}")
 
@@ -110,12 +115,12 @@ def engram_forward_profile(
     gates = []
     for hc_idx in range(backbone_config.hc_mult):
         with timer.measure("gating:key_proj+norm1"):
-            key = engram.key_projs[hc_idx](embeddings)
-            normed_key = engram.norm1[hc_idx](key)
+            key = engram.gpu.key_projs[hc_idx](embeddings)
+            normed_key = engram.gpu.norm1[hc_idx](key)
 
         with timer.measure("gating:query_norm2"):
             query = hidden_states[:, :, hc_idx, :]
-            normed_query = engram.norm2[hc_idx](query)
+            normed_query = engram.gpu.norm2[hc_idx](query)
 
         with timer.measure("gating:dot+nonlinear"):
             gate = (normed_key * normed_query).sum(dim=-1) / (backbone_config.hidden_size ** 0.5)
@@ -128,7 +133,7 @@ def engram_forward_profile(
 
     # 5) Value projection + apply gates
     with timer.measure("value_proj"):
-        v = engram.value_proj(embeddings)
+        v = engram.gpu.value_proj(embeddings)
         # log(f"***** v.shape={v.shape}")
 
     with timer.measure("apply_gates"):
@@ -137,7 +142,7 @@ def engram_forward_profile(
     # 6) ShortConv and residual-like add
     with timer.measure("short_conv"):
         # log("------->short_conv")        
-        conv_out = engram.short_conv(value)
+        conv_out = engram.gpu.short_conv(value)
         # log("------->short_conv end")
 
     with timer.measure("add"):
