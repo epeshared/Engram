@@ -52,6 +52,64 @@ _WAIT_STATS_LOCK = threading.Lock()
 _WAIT_CPU_FUTURE_MS: Dict[int, float] = {}
 
 
+class _SegmentProfiler:
+    """Lightweight timing breakdown.
+
+    When running on CUDA, uses CUDA events to measure GPU time for segments.
+    When running on CPU, falls back to host perf_counter_ns timings.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self._is_cuda = (device.type == "cuda") and torch.cuda.is_available()
+        self._order: List[str] = []
+        self._starts_evt: Dict[str, "torch.cuda.Event"] = {}
+        self._ends_evt: Dict[str, "torch.cuda.Event"] = {}
+        self._starts_ns: Dict[str, int] = {}
+        self._ends_ns: Dict[str, int] = {}
+
+    def start(self, name: str) -> None:
+        name = str(name)
+        if name not in self._order:
+            self._order.append(name)
+        if self._is_cuda:
+            evt = torch.cuda.Event(enable_timing=True)
+            evt.record(torch.cuda.current_stream(device=self.device))
+            self._starts_evt[name] = evt
+        else:
+            self._starts_ns[name] = time.perf_counter_ns()
+
+    def end(self, name: str) -> None:
+        name = str(name)
+        if self._is_cuda:
+            evt = torch.cuda.Event(enable_timing=True)
+            evt.record(torch.cuda.current_stream(device=self.device))
+            self._ends_evt[name] = evt
+        else:
+            self._ends_ns[name] = time.perf_counter_ns()
+
+    def results_ms(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if self._is_cuda:
+            # Ensure all recorded events have completed before reading elapsed times.
+            torch.cuda.synchronize(self.device)
+            for name in self._order:
+                s = self._starts_evt.get(name)
+                e = self._ends_evt.get(name)
+                if s is None or e is None:
+                    continue
+                out[name] = float(s.elapsed_time(e))
+            return out
+
+        for name in self._order:
+            s = self._starts_ns.get(name)
+            e = self._ends_ns.get(name)
+            if s is None or e is None:
+                continue
+            out[name] = float(e - s) / 1e6
+        return out
+
+
 def reset_retrieve_stats() -> None:
     with _RETRIEVE_STATS_LOCK:
         _RETRIEVE_TOT_MS.clear()
@@ -163,11 +221,17 @@ def human_format(num):
 
 @dataclass
 class EngramConfig:
-    # 0.67B级别配置
+    # 27B-level Engram embedding config (see note below).
     tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
+    # With max_ngram_size=3 and n_head_per_ngram=8, there are 16 tables per layer.
+    # With n_embed_per_ngram=512 => D_head=64. Roughly:
+    #   params_per_layer ~= (sum(table_sizes) * D_head) ~= (16 * V * 64)
+    # For layer_ids=[1,15] (2 layers), total params ~= 2 * 16 * V * 64.
+    # Setting V≈13.2M yields ~27B params total across these two layers.
+    # WARNING: this is enormous in memory; use ENGRAM_DEMO_SMALL=1 to shrink for runnable demos.
+    engram_vocab_size: List[int] = field(default_factory=lambda: [13_200_000, 13_200_000])
     # engram_vocab_size: List[int] = field(default_factory=lambda: [98_000_000, 98_000_000])
-    # engram_vocab_size: List[int] = field(default_factory=lambda: [65_333_333, 65_333_333])
-    engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
+    # engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
     n_head_per_ngram: int = 8
@@ -333,11 +397,19 @@ if _env_flag("ENGRAM_DEMO_SMALL", "0"):
     engram_cfg.engram_vocab_size = [engram_cfg.engram_vocab_size[0] // 100, engram_cfg.engram_vocab_size[1] // 100]
 
 
-def _simulate_block_compute(hidden_states: torch.Tensor, sim_ms: float, *, layer_id: Optional[int] = None) -> None:
+def _simulate_block_compute(
+    hidden_states: torch.Tensor,
+    sim_ms: float,
+    *,
+    layer_id: Optional[int] = None,
+    sync_after_cuda_sleep: bool = False,
+) -> None:
     """Simulate compute for a Transformer block without Engram.
 
     - CPU: sleeps for sim_ms.
-    - CUDA: enqueues a CUDA sleep kernel (no host-side blocking) when available.
+        - CUDA: enqueues a CUDA sleep kernel when available.
+            Optionally, waits for the current stream to finish that sleep so host-side Python
+            also experiences a delay (more realistic "GPU busy" simulation).
 
     This is intended for benchmarking overlap between CPU retrieval and backbone compute.
     """
@@ -360,6 +432,17 @@ def _simulate_block_compute(hidden_states: torch.Tensor, sim_ms: float, *, layer
                 torch.cuda._sleep(cycles)
             if _TIMELINE_VERBOSE:
                 tlog("block.sim_compute.cuda_sleep.enqueued", layer_id=layer_id)
+            if sync_after_cuda_sleep:
+                # Wait only for work enqueued on the current stream.
+                # This intentionally blocks the host to emulate a synchronous "GPU busy" wall time
+                # so CPU prefetch can overlap in a more realistic timeline.
+                if _TIMELINE_VERBOSE:
+                    tlog("block.sim_compute.stream_wait.begin", layer_id=layer_id)
+                evt = torch.cuda.Event(enable_timing=False)
+                evt.record(torch.cuda.current_stream(dev))
+                evt.synchronize()
+                if _TIMELINE_VERBOSE:
+                    tlog("block.sim_compute.stream_wait.done", layer_id=layer_id)
         else:
             # Fallback: run a small op. Duration is approximate.
             if _TIMELINE_VERBOSE:
@@ -661,7 +744,7 @@ class EngramCpuRetriever:
         layer_id: int,
         *,
         cpu_dtype: torch.dtype = torch.float16,
-        pin_memory: bool = True,
+        pin_memory: bool = False,
     ):
         self.layer_id = int(layer_id)
         self.cpu_dtype = cpu_dtype
@@ -809,9 +892,60 @@ class EngramPrefetcher:
         self.gpu_cache: Dict[int, torch.Tensor] = {}
         self.ready_events: Dict[int, torch.cuda.Event] = {}
 
+        self._cache_lock = threading.Lock()
+        self._h2d_ready_flags: Dict[int, threading.Event] = {}
+        self._errors: Dict[int, BaseException] = {}
+
         self._h2d_stream: Optional[torch.cuda.Stream] = None
         if self.device.type == "cuda":
             self._h2d_stream = torch.cuda.Stream(device=self.device)
+
+    def _enqueue_h2d_when_ready(self, layer_id: int, fut: Future) -> None:
+        """Continuation: when CPU retrieval finishes, enqueue H2D copy immediately.
+
+        Runs in the worker thread that completes the CPU future.
+        """
+        layer_id = int(layer_id)
+        # Ensure there is always a readiness flag to avoid duplicate H2D in get().
+        with self._cache_lock:
+            flag = self._h2d_ready_flags.get(layer_id)
+            if flag is None:
+                flag = threading.Event()
+                self._h2d_ready_flags[layer_id] = flag
+
+        try:
+            emb_cpu: torch.Tensor = fut.result()
+
+            # CPU-only fallback: nothing to enqueue.
+            if self.device.type != "cuda":
+                with self._cache_lock:
+                    self.gpu_cache[layer_id] = emb_cpu
+                flag.set()
+                return
+
+            # CUDA path: enqueue a non-blocking H2D on the dedicated stream.
+            assert self._h2d_stream is not None
+            nbytes = int(emb_cpu.numel() * emb_cpu.element_size())
+            tlog(
+                f"prefetch.h2d_continuation.begin bytes={_format_bytes(nbytes)} shape={tuple(emb_cpu.shape)}",
+                layer_id=layer_id,
+            )
+
+            with torch.cuda.stream(self._h2d_stream):
+                emb_gpu = emb_cpu.to(self.device, non_blocking=True)
+                evt = torch.cuda.Event()
+                evt.record(self._h2d_stream)
+
+            with self._cache_lock:
+                self.gpu_cache[layer_id] = emb_gpu
+                self.ready_events[layer_id] = evt
+            tlog("prefetch.h2d_continuation.enqueued", layer_id=layer_id)
+        except BaseException as e:
+            with self._cache_lock:
+                self._errors[layer_id] = e
+            tlog(f"prefetch.h2d_continuation.error {type(e).__name__}: {e}", layer_id=layer_id)
+        finally:
+            flag.set()
 
     def start(self, input_ids_cpu: torch.Tensor) -> None:
         tlog(
@@ -822,16 +956,30 @@ class EngramPrefetcher:
             if layer_id in self.futures:
                 continue
             tlog("prefetch.schedule", layer_id=layer_id)
-            self.futures[layer_id] = self.executor.submit(retriever.retrieve, input_ids_cpu)
+            fut = self.executor.submit(retriever.retrieve, input_ids_cpu)
+            self.futures[layer_id] = fut
+
+            # Create readiness flag up-front.
+            with self._cache_lock:
+                if layer_id not in self._h2d_ready_flags:
+                    self._h2d_ready_flags[layer_id] = threading.Event()
+
+            # If we're on CUDA, attach a continuation to enqueue H2D as soon as CPU finishes.
+            if self.device.type == "cuda":
+                fut.add_done_callback(lambda f, lid=int(layer_id): self._enqueue_h2d_when_ready(lid, f))
 
     def get(self, layer_id: int) -> torch.Tensor:
         layer_id = int(layer_id)
-        if layer_id in self.gpu_cache:
-            tlog("prefetch.cache_hit", layer_id=layer_id)
+        with self._cache_lock:
+            if layer_id in self._errors:
+                raise RuntimeError(f"Prefetch failed for layer_id={layer_id}") from self._errors[layer_id]
+            cached = self.gpu_cache.get(layer_id)
             evt = self.ready_events.get(layer_id)
-            if evt is not None:
+        if cached is not None:
+            tlog("prefetch.cache_hit", layer_id=layer_id)
+            if evt is not None and self.device.type == "cuda":
                 torch.cuda.current_stream(device=self.device).wait_event(evt)
-            return self.gpu_cache[layer_id]
+            return cached
 
         if layer_id not in self.futures:
             raise KeyError(f"No prefetch scheduled for layer_id={layer_id}")
@@ -850,6 +998,31 @@ class EngramPrefetcher:
             # Do not record anything: missing key => zero blocking wait for this layer.
             pass
 
+        # If a continuation already enqueued H2D and populated the cache, use it.
+        with self._cache_lock:
+            if layer_id in self._errors:
+                raise RuntimeError(f"Prefetch failed for layer_id={layer_id}") from self._errors[layer_id]
+            cached = self.gpu_cache.get(layer_id)
+            evt = self.ready_events.get(layer_id)
+            flag = self._h2d_ready_flags.get(layer_id)
+        if cached is not None:
+            if evt is not None and self.device.type == "cuda":
+                torch.cuda.current_stream(device=self.device).wait_event(evt)
+            return cached
+
+        # If CUDA continuation is in-flight (or about to populate cache), wait for it briefly.
+        if self.device.type == "cuda" and flag is not None:
+            flag.wait(timeout=10.0)
+            with self._cache_lock:
+                if layer_id in self._errors:
+                    raise RuntimeError(f"Prefetch failed for layer_id={layer_id}") from self._errors[layer_id]
+                cached = self.gpu_cache.get(layer_id)
+                evt = self.ready_events.get(layer_id)
+            if cached is not None:
+                if evt is not None:
+                    torch.cuda.current_stream(device=self.device).wait_event(evt)
+                return cached
+
         nbytes = int(emb_cpu.numel() * emb_cpu.element_size())
         tlog(
             "prefetch.cpu_embedding "
@@ -865,7 +1038,8 @@ class EngramPrefetcher:
                 f"prefetch.cpu_only.return bytes={_format_bytes(nbytes)} shape={tuple(emb_cpu.shape)}",
                 layer_id=layer_id,
             )
-            self.gpu_cache[layer_id] = emb_cpu
+            with self._cache_lock:
+                self.gpu_cache[layer_id] = emb_cpu
             return emb_cpu
 
         assert self._h2d_stream is not None
@@ -883,8 +1057,9 @@ class EngramPrefetcher:
         # Make the current stream wait on H2D completion.
         torch.cuda.current_stream(device=self.device).wait_event(evt)
         tlog("prefetch.h2d.waited", layer_id=layer_id)
-        self.gpu_cache[layer_id] = emb_gpu
-        self.ready_events[layer_id] = evt
+        with self._cache_lock:
+            self.gpu_cache[layer_id] = emb_gpu
+            self.ready_events[layer_id] = evt
         return emb_gpu
 
     def shutdown(self) -> None:
@@ -923,36 +1098,80 @@ class TransformerBlock(nn.Module):
             self.engram = Engram(layer_id=layer_id)
         self.layer_id = int(layer_id)
         self.non_engram_sim_ms: float = 0.0
+        self.simulate_block_sync: bool = False
     
-    def forward(self, input_ids: torch.Tensor, hidden_states: torch.Tensor, *, prefetcher: Optional[EngramPrefetcher] = None, input_ids_cpu: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        *,
+        prefetcher: Optional[EngramPrefetcher] = None,
+        input_ids_cpu: Optional[torch.Tensor] = None,
+        profiler: Optional[_SegmentProfiler] = None,
+    ):
+        blk_tag = f"block.{int(self.layer_id)}"
+        if profiler is not None:
+            profiler.start(blk_tag)
         if self.engram is not None:
             tlog("block.engram.enter", layer_id=self.layer_id)
             if prefetcher is not None:
                 tlog("block.engram.get_embeddings", layer_id=self.layer_id)
+                if profiler is not None:
+                    profiler.start(f"{blk_tag}.engram_get")
                 emb = prefetcher.get(self.layer_id)
+                if profiler is not None:
+                    profiler.end(f"{blk_tag}.engram_get")
                 tlog(
                     f"block.engram.gpu_fuse.begin emb={tuple(emb.shape)}",
                     layer_id=self.layer_id,
                 )
+                if profiler is not None:
+                    profiler.start(f"{blk_tag}.engram_fuse")
                 hidden_states = self.engram.gpu(hidden_states, emb) + hidden_states
+                if profiler is not None:
+                    profiler.end(f"{blk_tag}.engram_fuse")
                 tlog("block.engram.gpu_fuse.done", layer_id=self.layer_id)
             else:
                 if input_ids_cpu is None:
                     raise ValueError("input_ids_cpu is required when prefetcher is not provided (CPU hashing).")
                 tlog("block.engram.no_prefetch.cpu_retrieve", layer_id=self.layer_id)
+                if profiler is not None:
+                    profiler.start(f"{blk_tag}.engram_no_prefetch")
                 hidden_states = self.engram(hidden_states=hidden_states, input_ids_cpu=input_ids_cpu) + hidden_states
+                if profiler is not None:
+                    profiler.end(f"{blk_tag}.engram_no_prefetch")
             tlog("block.engram.exit", layer_id=self.layer_id)
         else:
             # Simulate backbone compute cost for blocks without Engram.
-            _simulate_block_compute(hidden_states, self.non_engram_sim_ms, layer_id=self.layer_id)
+            if profiler is not None:
+                profiler.start(f"{blk_tag}.sim")
+            _simulate_block_compute(
+                hidden_states,
+                self.non_engram_sim_ms,
+                layer_id=self.layer_id,
+                sync_after_cuda_sleep=self.simulate_block_sync,
+            )
+            if profiler is not None:
+                profiler.end(f"{blk_tag}.sim")
 
         if _TIMELINE_VERBOSE:
             tlog("block.attn", layer_id=self.layer_id)
+        if profiler is not None:
+            profiler.start(f"{blk_tag}.attn_residual")
         hidden_states = self.attn(hidden_states) + hidden_states
+        if profiler is not None:
+            profiler.end(f"{blk_tag}.attn_residual")
 
         if _TIMELINE_VERBOSE:
             tlog("block.moe", layer_id=self.layer_id)
+        if profiler is not None:
+            profiler.start(f"{blk_tag}.moe_residual")
         hidden_states = self.moe(hidden_states) + hidden_states
+        if profiler is not None:
+            profiler.end(f"{blk_tag}.moe_residual")
+
+        if profiler is not None:
+            profiler.end(blk_tag)
         return hidden_states
 
 
@@ -962,6 +1181,7 @@ class DemoLLM(nn.Module):
         *,
         cpu_retrieval_dtype: torch.dtype = torch.float16,
         non_engram_block_sim_ms: float = 0.0,
+        simulate_block_sync: bool = False,
     ):
         super().__init__()
         self.tok_emb = nn.Embedding(backbone_config.vocab_size, backbone_config.hidden_size)
@@ -972,6 +1192,7 @@ class DemoLLM(nn.Module):
                 blk.engram.cpu.cpu_dtype = cpu_retrieval_dtype
             else:
                 blk.non_engram_sim_ms = float(non_engram_block_sim_ms)
+                blk.simulate_block_sync = bool(simulate_block_sync)
         self.lm_head = nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size)
 
     def build_prefetcher(self, device: torch.device) -> Optional[EngramPrefetcher]:
@@ -985,23 +1206,48 @@ class DemoLLM(nn.Module):
             return None
         return EngramPrefetcher(cpu_retrievers=cpu_retrievers, device=device)
 
-    def forward(self, input_ids: torch.Tensor, *, prefetcher: Optional[EngramPrefetcher] = None, input_ids_cpu: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        prefetcher: Optional[EngramPrefetcher] = None,
+        input_ids_cpu: Optional[torch.Tensor] = None,
+        profiler: Optional[_SegmentProfiler] = None,
+    ) -> torch.Tensor:
         tlog(f"model.forward.begin device={input_ids.device} shape={tuple(input_ids.shape)}")
+        if profiler is not None:
+            profiler.start("tok_emb+expand")
         # Token embedding on device.
         hidden_states = self.tok_emb(input_ids)  # [B,L,D]
         # Mock hyper-connection (M branches).
         hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1).contiguous()  # [B,L,HC,D]
+        if profiler is not None:
+            profiler.end("tok_emb+expand")
 
+        if profiler is not None:
+            profiler.start("blocks")
         for blk in self.blocks:
             if _TIMELINE_VERBOSE:
                 tlog("model.block.begin", layer_id=blk.layer_id)
-            hidden_states = blk(input_ids=input_ids, hidden_states=hidden_states, prefetcher=prefetcher, input_ids_cpu=input_ids_cpu)
+            hidden_states = blk(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                prefetcher=prefetcher,
+                input_ids_cpu=input_ids_cpu,
+                profiler=profiler,
+            )
             if _TIMELINE_VERBOSE:
                 tlog("model.block.end", layer_id=blk.layer_id)
+        if profiler is not None:
+            profiler.end("blocks")
 
         # Mock hyper-connection collapse.
         hidden_states = hidden_states[:, :, 0, :]
+        if profiler is not None:
+            profiler.start("lm_head")
         logits = self.lm_head(hidden_states)
+        if profiler is not None:
+            profiler.end("lm_head")
         tlog(f"model.forward.done logits_shape={tuple(logits.shape)}")
         return logits
 
@@ -1033,6 +1279,31 @@ if __name__ == '__main__':
         help="Simulated compute time (ms) for Transformer blocks that do NOT contain Engram. "
         "(env: ENGRAM_NON_ENGRAM_BLOCK_SIM_MS)",
     )
+    parser.add_argument(
+        "--simulate-block-sync",
+        default=_env_flag("ENGRAM_SIM_SYNC", "0"),
+        action=argparse.BooleanOptionalAction,
+        help="If enabled, _simulate_block_compute will wait for the current CUDA stream after enqueuing the CUDA sleep. "
+        "This makes the host thread experience a similar wall-time delay (more realistic 'GPU busy' simulation), "
+        "giving CPU prefetch time to overlap. (env: ENGRAM_SIM_SYNC)",
+    )
+    parser.add_argument(
+        "--profile-breakdown",
+        action="store_true",
+        help="Print a simple forward-time breakdown (tok_emb+expand, blocks, lm_head). "
+        "Uses CUDA events on GPU; falls back to CPU timers otherwise.",
+    )
+    parser.add_argument(
+        "--profile-breakdown-blocks",
+        action="store_true",
+        help="With --profile-breakdown, also print per-block timings (and Engram sub-steps when present).",
+    )
+    parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=1,
+        help="Number of warmup forward passes to run before timing/profiling. Useful to avoid one-time CUDA init/autotune overhead skewing measurements.",
+    )
     args = parser.parse_args()
 
     tokenizer = _load_tokenizer(engram_cfg.tokenizer_name_or_path)
@@ -1046,6 +1317,7 @@ if __name__ == '__main__':
     model = DemoLLM(
         cpu_retrieval_dtype=torch.float16,
         non_engram_block_sim_ms=args.non_engram_block_sim_ms,
+        simulate_block_sync=args.simulate_block_sync,
     )
     model = model.to(device)
     model.eval()
@@ -1056,6 +1328,25 @@ if __name__ == '__main__':
         print(f"\n=== CASE: {case_name} ===\n{meta}", flush=True)
         print(f"input_ids_cpu.shape={tuple(input_ids_cpu.shape)} dtype={input_ids_cpu.dtype}", flush=True)
 
+        warmup_iters = max(0, int(getattr(args, "warmup_iters", 0)))
+        if warmup_iters > 0:
+            # Warm up CUDA kernels / library handles / caching allocator so the timed run is stable.
+            for _ in range(warmup_iters):
+                warm_prefetcher = model.build_prefetcher(device=device)
+                try:
+                    if warm_prefetcher is not None:
+                        warm_prefetcher.start(input_ids_cpu)
+                    warm_input_ids = input_ids_cpu.to(device)
+                    with torch.no_grad():
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        _ = model(warm_input_ids, prefetcher=warm_prefetcher, input_ids_cpu=input_ids_cpu, profiler=None)
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                finally:
+                    if warm_prefetcher is not None:
+                        warm_prefetcher.shutdown()
+
         # Schedule CPU retrieval in background threads (paper-like deterministic prefetch).
         prefetcher = model.build_prefetcher(device=device)
         try:
@@ -1065,11 +1356,17 @@ if __name__ == '__main__':
 
             input_ids = input_ids_cpu.to(device)
 
+            profiler: Optional[_SegmentProfiler] = None
+            if args.profile_breakdown:
+                profiler = _SegmentProfiler(device=device)
+                if device.type != "cuda":
+                    print("[WARN] --profile-breakdown enabled but CUDA is not available; using CPU timers.", flush=True)
+
             with torch.no_grad():
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 t_fwd0_ns = time.perf_counter_ns()
-                logits = model(input_ids, prefetcher=prefetcher, input_ids_cpu=input_ids_cpu)
+                logits = model(input_ids, prefetcher=prefetcher, input_ids_cpu=input_ids_cpu, profiler=profiler)
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 t_fwd1_ns = time.perf_counter_ns()
@@ -1095,6 +1392,33 @@ if __name__ == '__main__':
             f"cpu_wait_cpu_future_ms=({wait_parts}) cpu_wait_sum_ms={sum_wait_ms:.3f} cpu_wait_sum_pct={pct:.2f}%",
             flush=True,
         )
+
+        if args.profile_breakdown and profiler is not None:
+            seg = profiler.results_ms()
+            if seg:
+                ordered = ["tok_emb+expand", "blocks", "lm_head"]
+                parts = []
+                for k in ordered:
+                    if k in seg:
+                        parts.append(f"{k}={seg[k]:.3f}ms")
+                seg_sum = float(sum(seg.values()))
+                parts.append(f"sum={seg_sum:.3f}ms")
+                print(f"[PROFILE] {' '.join(parts)}", flush=True)
+
+                if args.profile_breakdown_blocks:
+                    # Print per-block totals, plus Engram-specific sub-steps where available.
+                    print("[PROFILE_BLOCKS]", flush=True)
+                    for layer_id in range(backbone_config.num_layers):
+                        blk = f"block.{layer_id}"
+                        if blk not in seg:
+                            continue
+                        line_parts = [f"layer{layer_id}={seg[blk]:.3f}ms"]
+                        for sub in ("sim", "engram_get", "engram_fuse", "engram_no_prefetch", "attn_residual", "moe_residual"):
+                            key = f"{blk}.{sub}"
+                            if key in seg:
+                                line_parts.append(f"{sub}={seg[key]:.3f}ms")
+                        print("  " + " ".join(line_parts), flush=True)
+
         print("✅ Forward Complete!", flush=True)
         print(f"input_ids.shape={tuple(input_ids.shape)} logits.shape={tuple(logits.shape)}", flush=True)
 
