@@ -79,6 +79,9 @@ What it does:
 - At Engram layers, pulls prefetched embeddings and fuses on device.
 - Prints `[TIME] forward_ms=...` plus per-layer CPU retrieval totals and their share of `forward_ms`.
 
+Prefetch note:
+- The demo prefetcher is “eager”: once a CPU retrieval future completes, it immediately enqueues the H2D copy on a dedicated CUDA stream.
+
 Tokenizer behavior:
 - If offline mode is enabled and the HF tokenizer is not cached locally, this script falls back to a minimal `DummyTokenizer` so the benchmark can still run.
 
@@ -93,7 +96,24 @@ python3 engram_offload_prefetch_demo.py --random --batch-size 8 --seq-len 512 --
 
 # Only run random batch
 python3 engram_offload_prefetch_demo.py --only-random --batch-size 30 --seq-len 100 --seed 123
+
+# Add simulated compute time for non-Engram blocks (CUDA sleep when on GPU)
+python3 engram_offload_prefetch_demo.py --only-random --batch-size 30 --seq-len 100 --seed 123 \
+  --non-engram-block-sim-ms 5
+
+# Print a simple breakdown and per-block timings (uses CUDA events on GPU)
+python3 engram_offload_prefetch_demo.py --only-random --batch-size 30 --seq-len 100 --seed 123 \
+  --non-engram-block-sim-ms 5 --profile-breakdown --profile-breakdown-blocks --warmup-iters 1
 ```
+
+Common flags:
+- `--non-engram-block-sim-ms <float>`: Simulated compute time (ms) for blocks without Engram.
+- `--warmup-iters <int>`: Warmup forwards before the timed run.
+- `--profile-breakdown`: Print forward breakdown (`tok_emb+expand`, `blocks`, `lm_head`).
+- `--profile-breakdown-blocks`: With `--profile-breakdown`, also print per-layer timings.
+- `--simulate-block-sync/--no-simulate-block-sync` (env: `ENGRAM_SIM_SYNC=1`):
+  - By default, CUDA sleep is enqueued asynchronously, so the Python host can “race ahead” through early layers.
+  - Enabling this option makes `_simulate_block_compute` wait for the current CUDA stream after enqueuing the sleep, which better models “GPU busy” wall time and gives CPU prefetch a realistic overlap window.
 
 Timeline logging:
 - `ENGRAM_TIMELINE=1` enables timeline prints.
@@ -105,3 +125,27 @@ Wrapper script: `run_offload_benchmark.sh`
 ```bash
 ./run_offload_benchmark.sh
 ```
+
+### Sweep `--non-engram-block-sim-ms` and log to CSV
+
+File: `run_sim_sync_sweep_to_csv.sh`
+
+What it does:
+- Runs the offload/prefetch demo 3 times with `ENGRAM_SIM_SYNC=1` and `--non-engram-block-sim-ms` in `{1,5,10}`.
+- For each run, grabs the last `[TIME] ...` line and appends a parsed row into a CSV.
+
+Usage:
+
+```bash
+./run_sim_sync_sweep_to_csv.sh               # writes to sim_sync_sweep_results.csv
+./run_sim_sync_sweep_to_csv.sh results.csv   # custom output path
+```
+
+CSV columns:
+- `timestamp`
+- `sim_ms`
+- `forward_ms`
+- `cpu_retrieve_tot` (raw contents inside `(...)`)
+- `cpu_wait_cpu_future_ms` (raw contents inside `(...)`)
+- `cpu_wait_sum_ms`
+- `cpu_wait_sum_pct`
