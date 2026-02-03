@@ -266,6 +266,17 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _parse_dtype(name: str) -> torch.dtype:
+    name = (name or "").strip().lower()
+    if name in {"fp32", "float32", "f32"}:
+        return torch.float32
+    if name in {"fp16", "float16", "f16", "half"}:
+        return torch.float16
+    if name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype '{name}'. Use one of: fp32, fp16, bf16.")
+
+
 _TIMELINE_ENABLED = _env_flag("ENGRAM_TIMELINE", "0")
 _TIMELINE_VERBOSE = _env_flag("ENGRAM_TIMELINE_VERBOSE", "0")
 _TIMELINE_START_NS = time.perf_counter_ns()
@@ -1273,6 +1284,14 @@ if __name__ == '__main__':
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--dtype",
+        type=str,
+        default=os.environ.get("ENGRAM_DTYPE", "bf16"),
+        choices=["fp32", "fp16", "bf16"],
+        help="Set a single dtype for both GPU-side DemoLLM modules and CPU-side Engram retrieval outputs. "
+        "(env: ENGRAM_DTYPE; default: fp32)",
+    )
+    parser.add_argument(
         "--non-engram-block-sim-ms",
         type=float,
         default=_env_float("ENGRAM_NON_ENGRAM_BLOCK_SIM_MS", 0.0),
@@ -1313,13 +1332,15 @@ if __name__ == '__main__':
     if device.type != "cuda":
         print("[WARN] CUDA not available; running everything on CPU (no overlap demo).")
 
+    model_dtype = _parse_dtype(args.dtype)
+
     # Build model: backbone on GPU, Engram retrieval stays on CPU.
     model = DemoLLM(
-        cpu_retrieval_dtype=torch.float16,
+        cpu_retrieval_dtype=model_dtype,
         non_engram_block_sim_ms=args.non_engram_block_sim_ms,
         simulate_block_sync=args.simulate_block_sync,
     )
-    model = model.to(device)
+    model = model.to(device=device, dtype=model_dtype)
     model.eval()
 
     def run_case(case_name: str, input_ids_cpu: torch.Tensor, *, meta: str) -> None:

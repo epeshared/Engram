@@ -21,7 +21,18 @@ from typing import Dict, Optional, Tuple
 import torch
 
 # Import the demo definitions.
-from engram_offload_prefetch_demo import Engram, MultiHeadEmbedding, engram_cfg, backbone_config
+# Note: this benchmark is often run from within the `benchmark/` folder, while
+# `engram_demo_v1.py` lives at the repo root. Add a small import fallback to
+# keep both `python benchmark/benchmark_engram_forward.py` and
+# `cd benchmark && python benchmark_engram_forward.py` working.
+try:
+    from engram_demo_v1 import Engram, MultiHeadEmbedding, engram_cfg, backbone_config
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from engram_demo_v1 import Engram, MultiHeadEmbedding, engram_cfg, backbone_config
 from transformers import AutoTokenizer
 
 
